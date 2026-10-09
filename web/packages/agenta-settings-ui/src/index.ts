@@ -56,6 +56,7 @@ export {
     CreditTopUpsSection,
     readTopUpReturn,
     topUpEntry,
+    TopUpReturnNotice,
     useTopUpOffer,
     withoutTopUpQuery,
     TOP_UP_QUERY,
