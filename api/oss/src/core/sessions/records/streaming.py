@@ -25,11 +25,6 @@ log = get_module_logger(__name__)
 
 MAXLEN_STREAMS_RECORDS = 100_000
 
-# Truncate attributes at ingest to avoid storing unbounded record bodies.
-MAX_ATTRIBUTES_BYTES = 64 * 1024  # 64 KB per record
-
-_TRUNCATION_MARKER = "…[truncated]"
-
 # Postgres stores neither `text` nor `jsonb` containing U+0000, so a single NUL anywhere in a
 # record body fails the INSERT with `UntranslatableCharacterError` (SQLSTATE 22P05). Record
 # bodies carry arbitrary tool output — a `grep` across a binary file is enough to produce one —
@@ -73,52 +68,6 @@ def _orjson_default(obj):
     if AsyncpgUUID is not None and isinstance(obj, AsyncpgUUID):
         return str(obj)
     raise TypeError(f"Type is not JSON serializable: {type(obj)}")
-
-
-def _truncate_attributes(attributes, budget: int, original_bytes: int):
-    """Shrink an oversized record body to fit `budget` while PRESERVING structure: small fields
-    (``type``/``id``/``name``…) stay intact and only the largest string values are trimmed, each
-    marked, so server-side history reconstruction still gets the event shape + partial content.
-    Falls back to a minimal discriminator-only shape when non-string bloat can't be trimmed."""
-    if original_bytes <= budget:
-        return attributes
-    if not isinstance(attributes, dict):
-        return {"_truncated": True, "_original_bytes": original_bytes}
-
-    result = dict(attributes)
-    trimmed: list[str] = []
-    # Trim the largest string field repeatedly until the serialized body fits (or none remain).
-    for _ in range(len(attributes)):
-        size = len(dumps(result, default=_orjson_default))
-        if size <= budget:
-            break
-        str_fields = [
-            (k, v)
-            for k, v in result.items()
-            if isinstance(v, str) and not k.startswith("_")
-        ]
-        if not str_fields:
-            break
-        key, value = max(str_fields, key=lambda kv: len(kv[1]))
-        overflow = size - budget
-        keep = max(
-            0, len(value) - overflow - 128
-        )  # margin for the marker + json overhead
-        result[key] = value[:keep] + _TRUNCATION_MARKER
-        if key not in trimmed:
-            trimmed.append(key)
-
-    if len(dumps(result, default=_orjson_default)) > budget:
-        # Non-string bloat remains → keep only the discriminator fields reconstruction needs.
-        return {
-            "type": attributes.get("type"),
-            "id": attributes.get("id"),
-            "_truncated": True,
-            "_original_bytes": original_bytes,
-        }
-
-    result["_truncated"] = {"fields": trimmed, "original_bytes": original_bytes}
-    return result
 
 
 def _get_redis():
@@ -285,33 +234,17 @@ async def publish_record(
 
     try:
         # Sanitize attributes before publishing so an unstorable record body is caught at the
-        # producer boundary, not after touching the DB: oversized bodies are truncated and NULs
-        # are stripped.
+        # producer boundary, not after touching the DB: NULs are stripped.
         sanitized_event = record_event
         if record_event.attributes is not None:
             attributes = record_event.attributes
-            raw_attributes = dumps(attributes, default=_orjson_default)
-            # Before the size check: stripping shrinks the body, and a NUL that survives to the
-            # DB costs the whole batch (see `_strip_nul`).
-            if _NUL_ESCAPE in raw_attributes:
+            # A NUL anywhere in the body fails the INSERT (see `_strip_nul`), so strip first.
+            if _NUL_ESCAPE in dumps(attributes, default=_orjson_default):
                 log.warning(
                     "[RECORDS] Stripped NUL characters from attributes",
                     session_id=str(record_event.session_id),
                 )
                 attributes = _strip_nul(attributes)
-                raw_attributes = dumps(attributes, default=_orjson_default)
-            if len(raw_attributes) > MAX_ATTRIBUTES_BYTES:
-                log.warning(
-                    "[RECORDS] Attributes truncated",
-                    session_id=str(record_event.session_id),
-                    original_bytes=len(raw_attributes),
-                )
-                # Keep the event shape + partial content so records stay reconstructable.
-                attributes = _truncate_attributes(
-                    attributes,
-                    MAX_ATTRIBUTES_BYTES,
-                    len(raw_attributes),
-                )
             if attributes is not record_event.attributes:
                 sanitized_event = record_event.model_copy(
                     update={"attributes": attributes}

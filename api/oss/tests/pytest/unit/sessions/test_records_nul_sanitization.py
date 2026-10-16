@@ -21,9 +21,7 @@ from orjson import dumps, loads
 from oss.src.core.sessions.records.dtos import SessionRecordEvent
 from oss.src.core.sessions.records.streaming import (
     _NUL_ESCAPE,
-    MAX_ATTRIBUTES_BYTES,
     _strip_nul,
-    _TRUNCATION_MARKER,
     publish_record,
 )
 
@@ -113,30 +111,13 @@ async def test_published_record_carries_no_nul():
     assert _NUL_ESCAPE not in dumps(attributes)
 
 
-async def test_nul_is_stripped_before_the_size_check():
-    """Stripping runs first so truncation measures the body that will actually be stored.
-
-    The body is oversized ONLY because of the NULs (each serializes as 6 bytes of `\\u0000`):
-    after stripping it fits the budget with room to spare, so if truncation ran first the
-    output would carry the truncation marker, and if stripping runs first it must not.
-    """
-    content = "p" * 1000
-    nul_padding = "\x00" * MAX_ATTRIBUTES_BYTES
+async def test_nul_is_stripped_from_an_unbounded_body():
+    """A body far larger than the old 64 KB ingest cap survives whole: NULs are stripped and
+    NOTHING is trimmed, so the context keeps every byte the runner produced."""
+    content = "p" * (256 * 1024)
     attributes = await _published_attributes(
-        {"type": "tool_result", "id": "call-2", "output": nul_padding + content}
+        {"type": "tool_result", "id": "call-2", "output": "\x00" + content}
     )
     assert attributes["id"] == "call-2"
     assert attributes["output"] == content
-    assert _TRUNCATION_MARKER not in attributes["output"]
-    assert _NUL_ESCAPE not in dumps(attributes)
-
-
-async def test_body_still_oversized_after_stripping_is_truncated():
-    """The two sanitizers compose: NULs gone AND the stored body bounded."""
-    padding = "p" * (MAX_ATTRIBUTES_BYTES * 2)
-    attributes = await _published_attributes(
-        {"type": "tool_result", "id": "call-3", "output": "\x00" + padding}
-    )
-    assert attributes["id"] == "call-3"
-    assert attributes["output"].endswith(_TRUNCATION_MARKER)
     assert _NUL_ESCAPE not in dumps(attributes)
